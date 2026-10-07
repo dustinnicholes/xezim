@@ -3439,6 +3439,11 @@ struct SvaClockedSite {
     /// The bare signal names `$past` reads in `body` (sorted, unique), found
     /// once at registration: the walk ran on every clock fire.
     past_names: Vec<String>,
+    /// §16.9.3: the NON-identifier operands of the sampled-value functions
+    /// (`$past(a && b)`, `$stable(v[3])`), keyed by `sva_past_expr_key`. Each
+    /// gets its own ring in `past_snapshots`, pushed with the expression's
+    /// sampled value at every clock fire, exactly like a bare signal's.
+    past_exprs: Vec<(String, Expression)>,
     /// The body compiled to an evaluable property tree (see `SvaNode`).
     node: std::sync::Arc<SvaNode>,
     /// §16.12 `disable iff (guard)`: while the guard holds, every attempt in
@@ -5708,6 +5713,12 @@ pub struct Simulator {
     /// replaced for its duration: (name, width, signed, real, string) as they
     /// were before. See `fb_frame_push`.
     fb_meta_saves: Vec<(String, Option<u32>, bool, bool, bool)>,
+    /// Declared-range entries (`module.packed_full_dims`) hidden while a
+    /// fallback frame carries a same-named local; restored on pop. A carried
+    /// local is always zero-based (`LocalKind::Int` admits no offset range),
+    /// so an entry left by another scope's `logic [5:1] x` must not remap
+    /// its bit labels.
+    fb_dims_saves: Vec<(String, Vec<(i64, i64)>)>,
     /// Lazily-built leaf index over `module.parameters` for the bytecode
     /// compiler's suffix-match fallback (see `lookup_param_value`). Built
     /// once — parameters are final before any bytecode compilation runs.
@@ -6037,6 +6048,12 @@ pub struct Simulator {
     /// being one clock cycle early. Only populated when `sva_sites` is
     /// non-empty; the referenced ids are those collected per site.
     sva_preponed: HashMap<usize, Value>,
+    /// Time slot whose Preponed samples `sva_preponed` holds. §4.4: the
+    /// Preponed region runs ONCE per slot, before Pre-Active. A later
+    /// `run_one_tick` in the same slot (a delta opened by a VPI callback or
+    /// a `#0` resume) must not re-sample, or an edge in that delta would
+    /// read values the slot's earlier NBA region already updated.
+    sva_preponed_time: Option<u64>,
     /// LRM §14.3 clocking-block per-cycle input snapshots. Each entry
     /// is `cb_name → (signal_name → pre-edge value)`. Updated in
     /// `tick_clocking_blocks` just before the clock signal's posedge
@@ -11599,6 +11616,7 @@ impl Simulator {
             name_stats_on: std::env::var("XEZIM_NAME_STATS").is_ok(),
             frame_pool: Vec::new(),
             fb_meta_saves: Vec::new(),
+            fb_dims_saves: Vec::new(),
             param_leaf_index_cell: std::cell::OnceCell::new(),
             var_decl_leaf_index_cell: std::cell::OnceCell::new(),
             forced_names: HashSet::default(),
@@ -11665,6 +11683,7 @@ impl Simulator {
             sva_sites: Vec::new(),
             active_sva_site: None,
             sva_preponed: HashMap::default(),
+            sva_preponed_time: None,
             clocking_snapshots: HashMap::default(),
             clocking_meta: HashMap::default(),
             clocking_output_pending: HashMap::default(),
@@ -47080,6 +47099,14 @@ impl Simulator {
         // The slot's start callbacks (cbNextSimTime, cbAtStartOfSimTime) come
         // first, in the first delta of the time, at the same point for the
         // same reason.
+        //
+        // LRM §4.4/§16.5.1: the Preponed region precedes Pre-Active, so the
+        // SVA samples are captured BEFORE any of those callbacks (or a timed
+        // resume) can write, and only in the slot's first delta.
+        if self.sva_preponed_time != Some(self.time) {
+            self.refresh_sva_preponed();
+            self.sva_preponed_time = Some(self.time);
+        }
         if self.vpi_slot_started != self.time {
             if self.vpi_cb_mask & vpi_cb::MASK_SLOT_START != 0 && self.vpi_slot_start() {
                 self.dirty_any = true;
@@ -47090,11 +47117,6 @@ impl Simulator {
             self.dirty_any = true;
         }
         self.fire_timing_timers();
-        // LRM §16.5.1: capture Preponed (slot-entry) samples of every
-        // SVA-referenced signal BEFORE the active/NBA regions run, so a
-        // clocked assertion firing later this slot (tick_sva_sites) samples
-        // pre-edge values rather than same-edge NBA updates.
-        self.refresh_sva_preponed();
         // LRM §14.4 `#1step` clocking-input skew: capture the same Preponed
         // (slot-entry) samples for clocking-block inputs, so `cb.<in>` read
         // after a posedge later this slot sees the pre-edge value.
@@ -64524,6 +64546,37 @@ impl Simulator {
     /// Outlined from `assign_value_inner` (see `exec_stmt_blocking_assign`): keeps
     /// the dispatcher's stack frame small.
     #[inline(never)]
+    /// §7.4.1 / §11.5.1: storage bit for bit LABEL `idx` of a plain
+    /// one-dimensional packed vector named `name` (or its bare `bare`), from
+    /// its declared range: `logic [5:1] v; v[1]` is storage bit 0, and an
+    /// ascending `[0:7]` mirrors. `None` when the name has no such range
+    /// (storage index == label); `Some(None)` when the label is x/z or
+    /// outside the range, which writes nothing.
+    fn plain_vector_bit_storage(&self, name: &str, bare: &str, idx: &Value) -> Option<Option<usize>> {
+        let key = [name, bare]
+            .into_iter()
+            .find(|k| self.module.packed_full_dims.contains_key(*k))?;
+        if self.module.arrays.contains_key(key)
+            || self.is_associative_array(key)
+            || self.module.packed_signal_elem_widths.get(key).is_some_and(|&ew| ew > 1)
+        {
+            return None;
+        }
+        let &[(dl, dr)] = self.module.packed_full_dims.get(key)?.as_slice() else {
+            return None;
+        };
+        if dl >= dr && dr == 0 {
+            return None;
+        }
+        if idx.has_xz() {
+            return Some(None);
+        }
+        let l = idx.to_i64()?;
+        let phys = if dl >= dr { l - dr } else { dr - l };
+        let w = (dl - dr).unsigned_abs() as i64 + 1;
+        Some((0..w).contains(&phys).then_some(phys as usize))
+    }
+
     fn assign_value_index(
         &mut self,
         lhs: &Expression,
@@ -64858,7 +64911,14 @@ impl Simulator {
                             .and_then(|f| f.get(base.as_ref()))
                             .cloned()
                     {
-                        let bit = i as usize;
+                        // A plain frame-local vector (`logic [5:1] v;` in a
+                        // loop body) reaches this arm too; its label maps
+                        // through the declared range like any vector's.
+                        let bit = match self.plain_vector_bit_storage(&base, &base, &Value::from_u64(i as u64, 64)) {
+                            Some(Some(phys)) => phys,
+                            Some(None) => return false,
+                            None => i as usize,
+                        };
                         if bit < cur.width as usize {
                             let nb = val.bits_first();
                             let old = cur.get_bit(bit);
@@ -65826,7 +65886,14 @@ impl Simulator {
                 }
             }
             // Fall back to bit select assignment
-            let idx = idx_val.to_u64().unwrap_or(0) as usize;
+            let mut idx = idx_val.to_u64().unwrap_or(0) as usize;
+            if let Some(h) = hier_opt.filter(|h| h.path.len() == 1) {
+                match self.plain_vector_bit_storage(&name, &h.path[0].name.name, &idx_val) {
+                    Some(Some(phys)) => idx = phys,
+                    Some(None) => return false, // x/z or out-of-range label
+                    None => {}
+                }
+            }
             // Bit-select write on a LOCAL packed vector (e.g.
             // `bit [7:0] seen; seen[i] = 1'b1;` inside an initial /
             // task). Locals live in local_stack, not signal_table —
@@ -69363,10 +69430,10 @@ impl Simulator {
                 // Inside a concurrent assertion the site's per-cycle ring is the
                 // history (index N = N clock ticks ago, sampled values).
                 if let Some(site_idx) = self.active_sva_site {
-                    let sig_name = match args.first().map(|a| &a.kind) {
-                        Some(ExprKind::Ident(h)) => self.resolve_hier_name(h).into_owned(),
-                        _ => String::new(),
-                    };
+                    let sig_name = args
+                        .first()
+                        .map(|a| self.sva_past_operand_key(a))
+                        .unwrap_or_default();
                     let n_cycles = args
                         .get(1)
                         .filter(|a| !matches!(a.kind, ExprKind::Null))
@@ -69449,19 +69516,38 @@ impl Simulator {
                         Value::zero(1)
                     };
                 }
-                let sig_name = match args.first().map(|a| &a.kind) {
-                    Some(ExprKind::Ident(h)) => self.resolve_hier_name(h),
-                    _ => std::borrow::Cow::Owned(String::new()),
+                let (sig_name, cur) = match args.first() {
+                    Some(Expression { kind: ExprKind::Ident(h), .. }) => {
+                        let n = self.resolve_hier_name(h).into_owned();
+                        let c = self
+                            .get_signal_value_by_name(&n)
+                            .unwrap_or_else(|| Value::zero(32));
+                        (n, c)
+                    }
+                    // §16.9.3: an expression operand's current sample is the
+                    // expression itself (its operands' preponed values are
+                    // installed while the site evaluates).
+                    Some(a) if self.active_sva_site.is_some() => {
+                        (Self::sva_past_expr_key(a), self.eval_expr(a))
+                    }
+                    _ => (String::new(), Value::zero(32)),
                 };
-                let cur = self
-                    .get_signal_value_by_name(&sig_name)
-                    .unwrap_or_else(|| Value::zero(32));
-                let prev_opt = self.active_sva_site.and_then(|si| {
+                let ring = self.active_sva_site.and_then(|si| {
                     self.sva_sites
                         .get(si)
                         .and_then(|s| s.past_snapshots.get(&*sig_name))
-                        .and_then(|r| r.get(1).cloned())
                 });
+                let prev_opt = ring.and_then(|r| r.get(1).cloned());
+                // §16.9.3: the CURRENT operand is this clock tick's sampled
+                // value, which `refresh_sva_past_snapshots` pushed to ring[0]
+                // before the site evaluated. Reading the operand again by
+                // name could land on a different storage cell than the one
+                // the Preponed values were installed in (a TB net aliased to
+                // a submodule port), and returned the post-NBA value.
+                let cur = match ring.and_then(|r| r.front()) {
+                    Some(v) => v.clone(),
+                    None => cur,
+                };
                 if Self::sampled_change_fn(&name, &cur, prev_opt.as_ref()) {
                     Value::ones(1)
                 } else {
@@ -85200,6 +85286,8 @@ impl Simulator {
                             // however many sampled-value calls reference it.
                             past_names.sort_unstable();
                             past_names.dedup();
+                            let mut past_exprs = Vec::new();
+                            Self::collect_past_arg_exprs(&body_expanded, &mut past_exprs);
                             self.sva_resolve_signals(&mut body_expanded);
                             let (disable, node) = self.sva_compile_site(&body_expanded);
                             let scope = self.active_instance_scope();
@@ -85223,6 +85311,7 @@ impl Simulator {
                                 iff,
                                 body: body_expanded,
                                 past_names,
+                                past_exprs,
                                 node: std::sync::Arc::new(node),
                                 disable,
                                 prev_clock: 2, // sentinel
@@ -90367,6 +90456,39 @@ impl Simulator {
                     out.push(id);
                 }
             }
+            // §16.5.1: a hierarchical operand inside a NAMED property or
+            // sequence (`property p; dut.x |=> …; endproperty`) reaches here
+            // as a member-access chain, not the flat Ident an inline
+            // assertion gets. It is sampled like any other operand; missing
+            // it read the live, post-NBA value, so the antecedent matched one
+            // clock early.
+            ExprKind::MemberAccess { expr: base, .. } => {
+                fn flat(e: &Expression) -> Option<String> {
+                    match &e.kind {
+                        ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => Some(
+                            h.path
+                                .iter()
+                                .map(|s| s.name.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join("."),
+                        ),
+                        ExprKind::MemberAccess { expr, member } => {
+                            Some(format!("{}.{}", flat(expr)?, member.name))
+                        }
+                        _ => None,
+                    }
+                }
+                let id = flat(expr).and_then(|n| {
+                    self.signal_name_to_id.get(n.as_str()).copied().or_else(|| {
+                        self.hint_scoped(&n)
+                            .and_then(|q| self.signal_name_to_id.get(q.as_str()).copied())
+                    })
+                });
+                match id {
+                    Some(id) => out.push(id),
+                    None => self.collect_sva_signal_ids(base, out),
+                }
+            }
             ExprKind::Unary { operand, .. } => self.collect_sva_signal_ids(operand, out),
             ExprKind::Binary { left, right, .. } => {
                 self.collect_sva_signal_ids(left, out);
@@ -90415,19 +90537,17 @@ impl Simulator {
                     self.collect_sva_signal_ids(e, out);
                 }
             }
-            ExprKind::SystemCall { name, args } => {
-                // `$past/$rose/$fell/$stable/$changed` already read from the
-                // per-site ring buffers; their bare argument must NOT be
-                // preponed here (that would double-sample). Skip a leading
-                // bare-Ident argument to those calls; still walk the rest.
-                let skip_first = matches!(
-                    name.as_str(),
-                    "$past" | "$rose" | "$fell" | "$stable" | "$changed"
-                );
-                for (i, a) in args.iter().enumerate() {
-                    if skip_first && i == 0 && matches!(a.kind, ExprKind::Ident(_)) {
-                        continue;
-                    }
+            ExprKind::SystemCall { args, .. } => {
+                // §16.9.3: the argument of `$past/$rose/$fell/$stable/$changed`
+                // is a SAMPLED value too. It must be in the Preponed set: the
+                // per-site ring (refresh_sva_past_snapshots) records the
+                // preponed value only for ids listed here, and `$stable`'s
+                // current operand is read from the signal table while the
+                // preponed values are installed. Leaving it out made both the
+                // ring entry and the current operand the post-NBA value, so
+                // `$stable(q)` failed whenever `q` updated on the edge that
+                // checked it.
+                for a in args {
                     self.collect_sva_signal_ids(a, out);
                 }
             }
@@ -90674,9 +90794,6 @@ impl Simulator {
         const PAST_MAX_DEPTH: usize = 16;
         // Deduplicated at registration: a duplicate name would make ring[1]
         // another copy of the current cycle instead of the prior one.
-        if self.sva_sites[site_idx].past_names.is_empty() {
-            return;
-        }
         let names = std::mem::take(&mut self.sva_sites[site_idx].past_names);
         for name in &names {
             // The sampled (Preponed) value when the site tracks the signal.
@@ -90700,6 +90817,30 @@ impl Simulator {
             }
         }
         self.sva_sites[site_idx].past_names = names;
+        if !self.sva_sites[site_idx].past_exprs.is_empty() {
+            // The expression's SAMPLED value: its operands read through the
+            // Preponed values, as the property body itself does. Evaluated
+            // AFTER the signal histories above take this cycle's sample, so a
+            // nested `$past(a)` in the expression reads the right cycle.
+            let exprs = std::mem::take(&mut self.sva_sites[site_idx].past_exprs);
+            // One at a time, in the post-order `collect_past_arg_exprs`
+            // builds: an inner history is pushed before an outer expression
+            // reads it.
+            let saved = self.install_preponed(sampled_ids);
+            for (key, e) in &exprs {
+                let v = self.eval_expr(e);
+                let ring = self.sva_sites[site_idx]
+                    .past_snapshots
+                    .entry(key.clone())
+                    .or_default();
+                ring.push_front(v);
+                while ring.len() > PAST_MAX_DEPTH {
+                    ring.pop_back();
+                }
+            }
+            self.restore_preponed(saved);
+            self.sva_sites[site_idx].past_exprs = exprs;
+        }
     }
 
     /// Replace each plain signal read in a concurrent assertion's body with
@@ -90802,6 +90943,88 @@ impl Simulator {
             v.is_real = true;
         }
         v
+    }
+
+    /// Ring key for a NON-identifier sampled-value operand: its source span,
+    /// which every evaluation of the same call site shares.
+    fn sva_past_expr_key(e: &Expression) -> String {
+        format!("\u{1}expr@{}:{}", e.span.start, e.span.end)
+    }
+
+    /// The `past_snapshots` key of a sampled-value function's operand: the
+    /// resolved signal name for a bare identifier, else the expression key.
+    fn sva_past_operand_key(&self, a: &Expression) -> String {
+        match &a.kind {
+            ExprKind::Ident(h) => self.resolve_hier_name(h).into_owned(),
+            _ => Self::sva_past_expr_key(a),
+        }
+    }
+
+    /// Collect the non-identifier operands of `$past/$rose/$fell/$stable/
+    /// $changed` (see `SvaClockedSite::past_exprs`), unique by key.
+    fn collect_past_arg_exprs(expr: &Expression, out: &mut Vec<(String, Expression)>) {
+        match &expr.kind {
+            ExprKind::SystemCall { name, args } => {
+                // Post-order: a nested operand (`$past(a)` inside
+                // `$past($past(a))`) is listed before the expression that
+                // reads its history, so each cycle's refresh records the
+                // inner history first.
+                for a in args {
+                    Self::collect_past_arg_exprs(a, out);
+                }
+                if matches!(
+                    name.as_str(),
+                    "$past" | "$rose" | "$fell" | "$stable" | "$changed"
+                ) {
+                    if let Some(a) = args.first() {
+                        if !matches!(a.kind, ExprKind::Ident(_)) {
+                            let key = Self::sva_past_expr_key(a);
+                            if !out.iter().any(|(k, _)| *k == key) {
+                                out.push((key, a.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+            ExprKind::Binary { left, right, .. } => {
+                Self::collect_past_arg_exprs(left, out);
+                Self::collect_past_arg_exprs(right, out);
+            }
+            ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => {
+                Self::collect_past_arg_exprs(operand, out);
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                Self::collect_past_arg_exprs(condition, out);
+                Self::collect_past_arg_exprs(then_expr, out);
+                Self::collect_past_arg_exprs(else_expr, out);
+            }
+            ExprKind::Concatenation(parts) => {
+                for p in parts {
+                    Self::collect_past_arg_exprs(p, out);
+                }
+            }
+            ExprKind::Index { expr: b, index } => {
+                Self::collect_past_arg_exprs(b, out);
+                Self::collect_past_arg_exprs(index, out);
+            }
+            ExprKind::Call { args, .. } => {
+                for a in args {
+                    Self::collect_past_arg_exprs(a, out);
+                }
+            }
+            ExprKind::Inside { expr: e, ranges } => {
+                Self::collect_past_arg_exprs(e, out);
+                for r in ranges {
+                    Self::collect_past_arg_exprs(r, out);
+                }
+            }
+            ExprKind::SvaClocked { body, .. } => Self::collect_past_arg_exprs(body, out),
+            _ => {}
+        }
     }
 
     /// Walk `expr` and append every bare signal name referenced by a
@@ -94191,9 +94414,17 @@ impl Simulator {
                             dyn_kind = 1;
                         }
                     }
+                    // A DYNAMIC part-select (`v[p*W +: W]`, `m[p]` with a
+                    // loop or runtime index) reads a window that moves at run
+                    // time, so the whole signal is its input. It used to match
+                    // nothing here: the block's read set omitted the signal, a
+                    // change to it alone looked like "no input changed", and
+                    // the edge block was skipped — its registers held stale
+                    // values until some other input moved.
                     Insn::LoadSignal(_, s)
                     | Insn::LoadSignalSigned(_, s)
                     | Insn::LoadSignalBit(_, s, _)
+                    | Insn::LoadSignalRangeDyn(_, s, ..)
                     | Insn::BranchIfSignalFalse(s, _, _) => {
                         let w = self.signal_widths[*s as usize].min(u16::MAX as u32) as u16;
                         if seen.insert((*s as u32, 0, w)) {
@@ -96664,7 +96895,15 @@ impl Simulator {
                         }
                     }
                 }
-                1
+                // §7.4/§7.2: an element select whose base is a STRUCT member
+                // path (`q.e[k].c[5]`, a packed array inside a packed
+                // struct array) has no root identifier above, so it fell
+                // through to 1 — an NBA then resized its RHS to one bit before
+                // queueing it and stored only the LSB, while the blocking
+                // form of the same assignment was correct. The expression's
+                // own width is the selected element's; a true bit-select
+                // still reports 1.
+                self.infer_width(expr).max(1)
             }
             _ => self.infer_width(expr),
         }
@@ -107996,15 +108235,19 @@ impl Simulator {
     /// interpreted declaration makes and a compiled one never did; they are
     /// set for the statement's duration and restored after it. Returns the
     /// frame depth and the mark of the saved registrations.
-    fn fb_frame_push(&mut self, locals: &[super::bytecode::FbLocal]) -> (usize, usize) {
+    fn fb_frame_push(&mut self, locals: &[super::bytecode::FbLocal]) -> (usize, usize, usize) {
         use super::bytecode::LocalKind;
         let depth = self.local_stack.len();
         let mark = self.fb_meta_saves.len();
+        let dims_mark = self.fb_dims_saves.len();
         let mut f = self.take_pooled_frame();
         for l in locals {
             let v = Self::fb_fit(self.vm_regs[l.reg as usize].clone(), l.kind);
             f.insert(l.name.to_string(), v);
             let name = l.name.as_ref();
+            if let Some(d) = self.module.packed_full_dims.remove(name) {
+                self.fb_dims_saves.push((name.to_string(), d));
+            }
             let cur = (
                 self.widths.get(name).copied(),
                 self.signed_signals.contains(name),
@@ -108024,7 +108267,7 @@ impl Simulator {
             }
         }
         self.push_local_frame(f);
-        (depth, mark)
+        (depth, mark, dims_mark)
     }
 
     fn fb_meta_apply(&mut self, name: &str, m: (Option<u32>, bool, bool, bool)) {
@@ -108055,11 +108298,16 @@ impl Simulator {
 
     /// Pop the frame `fb_frame_push` made and copy each local back to its
     /// register, fitted to its declaration as a compiled assignment would.
-    fn fb_frame_pop(&mut self, locals: &[super::bytecode::FbLocal], at: (usize, usize)) {
-        let (depth, mark) = at;
+    fn fb_frame_pop(&mut self, locals: &[super::bytecode::FbLocal], at: (usize, usize, usize)) {
+        let (depth, mark, dims_mark) = at;
         while self.fb_meta_saves.len() > mark {
             if let Some((name, w, sg, re, st)) = self.fb_meta_saves.pop() {
                 self.fb_meta_apply(&name, (w, sg, re, st));
+            }
+        }
+        while self.fb_dims_saves.len() > dims_mark {
+            if let Some((name, d)) = self.fb_dims_saves.pop() {
+                self.module.packed_full_dims.insert(name, d);
             }
         }
         // The statement ran to completion (no fallback that carries locals
@@ -113883,7 +114131,15 @@ impl Simulator {
                 // copied a packed container nobody reads, leaving the members
                 // x, while the same statement at top level resolved through
                 // `flat_path_type`.
-                let base = name.rfind('[').map(|i| &name[..i])?;
+                // Only when the select is the LAST component: `u.arr[1].value`
+                // names a MEMBER of the element, and taking the element's
+                // struct type for it made the unpacked-struct NBA expansion
+                // treat the leaf as a struct, append `.value` again and
+                // re-issue itself without end (`…value.value.value…`).
+                let base = name
+                    .strip_suffix(']')
+                    .and_then(|_| name.rfind('['))
+                    .map(|i| &name[..i])?;
                 if base.is_empty() {
                     return None;
                 }
@@ -129109,6 +129365,19 @@ impl Simulator {
         }
         links.reverse();
         let m = &self.module;
+        // §6.18/§23.10: a bare type name inside an INSTANTIATED module may
+        // name that module's own typedef, which elaboration registers per
+        // instance under `<instance>.<T>` because its layout can depend on
+        // the instance's parameters. The bare key belongs to whichever
+        // instance registered it, so `ptr_t'(x)` in a 7-bit instance cast
+        // through a 5-bit sibling's layout and dropped the top bit.
+        if links.len() == 1 {
+            if let Some(scoped) = self.hint_scoped(&links[0]) {
+                if m.typedef_types.contains_key(&scoped) || m.typedefs.contains_key(&scoped) {
+                    return Some(scoped);
+                }
+            }
+        }
         // Try the longest join first (`pkg::cls::T`), then shorter
         // suffixes (`cls::T`), then the bare leaf — the old single-link
         // behavior is the len==2 case.

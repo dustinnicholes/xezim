@@ -689,7 +689,18 @@ impl Simulator {
         }
         self.check_edges();
         let _ = self.drain_edge_cascade(self.cascade_limit);
+        // §16.5: a clock edge written from a cbReadWriteSynch/cbNBASynch
+        // routine (cocotb's default clock) is an edge of THIS slot. Evaluate
+        // the clocked assertions now, against the slot's Preponed samples;
+        // otherwise the edge is first seen by the next slot's tick, which
+        // has re-sampled after this delta's NBA region.
+        self.tick_sva_sites();
         self.snapshot_edge_signals();
+        // A delta opened here can run after the tick's own waveform flush
+        // (a cbReadWriteSynch deferred to the slot's end). Record its changes
+        // under THIS slot's time; left for the next tick's flush they were
+        // stamped one time step late (`rst_n` written at 3000 dumped at 3500).
+        self.dump_write_changes();
         self.vpi_same_time_work()
     }
 

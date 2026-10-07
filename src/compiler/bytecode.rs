@@ -5258,6 +5258,25 @@ impl<'a> BytecodeCompiler<'a> {
     /// `flat = (i-lo1)*ncols + (j-lo2)`, with an out-of-range index in EITHER
     /// dimension forced one past the operand's range so the element access
     /// itself reports it (§7.4.6: read yields x, write is discarded).
+    /// Element width of a 2-D unpacked array when `outer` is `a[i]` and `a`
+    /// is one (looked up as `compile_2d_flat_index` resolves the name).
+    fn array_2d_elem_width(&self, outer: &Expression) -> Option<u32> {
+        let ExprKind::Index { expr: base, .. } = &outer.kind else {
+            return None;
+        };
+        let ExprKind::Ident(hier) = &base.kind else {
+            return None;
+        };
+        let raw = Self::hier_raw_name(hier);
+        let arrays_2d = self.arrays_2d?;
+        let (_, _, w) = arrays_2d.get(raw.as_str()).copied().or_else(|| {
+            self.scope_hint
+                .as_ref()
+                .and_then(|sc| arrays_2d.get(cat_dot(sc, &raw).as_str()).copied())
+        })?;
+        (w > 0).then_some(w)
+    }
+
     fn compile_2d_flat_index(
         &mut self,
         hier: &crate::ast::expr::HierarchicalIdentifier,
@@ -12491,6 +12510,20 @@ impl<'a> BytecodeCompiler<'a> {
                             return None;
                         }
                     }
+                    // §6.18/§23.10: a bare name in an instantiated module may
+                    // be that instance's own (parameter-dependent) typedef,
+                    // registered under `<instance>.<T>`; the bare entry is
+                    // some other instance's layout. Same rule as the
+                    // interpreter's `named_cast_key`.
+                    let target = target.map(|nm| {
+                        if nm.contains("::") {
+                            return nm;
+                        }
+                        match self.scope_hint.as_ref().map(|sc| cat_dot(sc, &nm)) {
+                            Some(k) if self.cast_widths.is_some_and(|m| m.contains_key(&k)) => k,
+                            _ => nm,
+                        }
+                    });
                     let known = literal_w.map(|w| (w, false)).or_else(|| {
                         target.as_ref().and_then(|nm| {
                             self.cast_widths
@@ -15468,6 +15501,13 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                     // Not an array — bit-select on a plain packed signal; width = 1.
                     1
+                } else if let Some(w) = self.array_2d_elem_width(expr) {
+                    // `a[i][j]` on a 2-D UNPACKED array: the ELEMENT's declared
+                    // width, the same table `compile_2d_flat_index` addresses.
+                    // The 32-bit default below truncated every element wider
+                    // than 32 bits that a compiled block stored, while the
+                    // interpreter (and a 1-D array) stored it whole.
+                    w
                 } else if self.plain_unpacked_elem(expr).is_some() {
                     // A bit of one unpacked-array element (`arr[i][j]`): the
                     // context width of its RHS is 1 (§11.6.1), not 32.

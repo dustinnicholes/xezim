@@ -111,3 +111,5 @@ mod vpi_typed_port_kinds;
 mod wide_string2num;
 #[path = "strings/dpi_semantics.rs"]
 mod dpi_semantics;
+#[path = "strings/vpi_rw_clock_sampling.rs"]
+mod vpi_rw_clock_sampling;

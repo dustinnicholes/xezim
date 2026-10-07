@@ -282,3 +282,7 @@ mod sva_local_diagnostics;
 mod sva_semantics_reference;
 #[path = "scheduling/waiter_cont_anyedge_wake.rs"]
 mod waiter_cont_anyedge_wake;
+#[path = "scheduling/sva_sampled_operands.rs"]
+mod sva_sampled_operands;
+#[path = "scheduling/edge_skip_dynamic_range_read.rs"]
+mod edge_skip_dynamic_range_read;

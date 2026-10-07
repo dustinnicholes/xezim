@@ -85,3 +85,70 @@ fn artifact_modes_round_trip() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// An artifact written with the PREVIOUS layout version must be rejected by
+/// its version byte with a recompile hint, not accepted and then fail half-way
+/// through deserialization: bincode is positional, so a layout with one more
+/// field cannot read the old stream. Covers raw and zstd bodies.
+#[test]
+fn previous_artifact_version_is_rejected() {
+    let bin = xezim_bin();
+    if !bin.exists() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("xezim_artv_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("t.sv"),
+        "module tb;\n  initial begin $display(\"BODY\"); $finish; end\nendmodule\n",
+    )
+    .expect("write");
+    for (name, extra) in [
+        ("v_zstd", &[][..]),
+        ("v_raw", &["--artifact-compression", "none"][..]),
+    ] {
+        let o = Command::new(&bin)
+            .arg("--compile")
+            .arg(dir.join("t.sv"))
+            .args(["-s", "tb", "-o"])
+            .arg(dir.join(name))
+            .args(extra)
+            .output()
+            .expect("compile");
+        assert!(o.status.success(), "compile {name} failed");
+        let mut bytes = std::fs::read(dir.join(name)).expect("read artifact");
+        assert_eq!(&bytes[..7], b"XEZIMBC", "{name}: artifact header");
+        let current = bytes[7];
+        bytes[7] = current - 1;
+        let stale = dir.join(format!("{name}_stale"));
+        std::fs::write(&stale, &bytes).expect("write stale artifact");
+
+        let o = Command::new(&bin)
+            .arg("--simulate")
+            .arg(&stale)
+            .output()
+            .expect("simulate");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        );
+        assert!(
+            !o.status.success(),
+            "{name}: stale artifact accepted:\n{text}"
+        );
+        let want = format!(
+            "incompatible xezim artifact version (file v{}, expected v{})",
+            current - 1,
+            current
+        );
+        assert!(text.contains(&want), "{name}: expected `{want}`:\n{text}");
+        assert!(
+            !text.contains("deserialize"),
+            "{name}: reached the decoder:\n{text}"
+        );
+        assert!(!text.contains("BODY"), "{name}: simulated:\n{text}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -2901,7 +2901,11 @@ suppressed but the explicit SDF annotation still applies."
             .as_ref()
             .map(|v| v.iter().take(8).copied().collect::<Vec<u8>>())
         {
-            if head.len() == 8 && &head[..] == xezim::XEZIM_BYTECODE_MAGIC {
+            // Any `XEZIMBC` header is an artifact: one from another layout
+            // version reaches `read_compiled`, which rejects it by its version
+            // byte. Matching the CURRENT magic only sent such a file to the
+            // source parser, which panicked on the binary body.
+            if head.len() == 8 && head[..7] == xezim::XEZIM_BYTECODE_MAGIC[..7] {
                 match xezim::read_compiled(sf) {
                     Ok(Some(elab)) => {
                         chatter_out!("Loaded compiled: {}", sf);
